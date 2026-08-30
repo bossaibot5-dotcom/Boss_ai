@@ -17,9 +17,9 @@ from telebot.types import (
 )
 
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 FREE_LIMIT = 15
@@ -170,7 +170,7 @@ def ask_gemini(user_id, text):
     prompt = system_prompt() + "\n\nPrevious conversation:\n" + conversation + "\n\nCurrent user message:\n" + text
 
     client = genai.Client(api_key=GEMINI_API_KEY)
-    response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+    response = client.models.generate_content(model="gemini-3.6-flash", contents=prompt)
 
     if not response.text:
         raise RuntimeError("Gemini returned an empty response.")
