@@ -3,6 +3,7 @@ import time
 import sqlite3
 import threading
 import base64
+import io
 import traceback
 import requests
 import telebot
@@ -86,6 +87,7 @@ def main_keyboard():
     markup.row(KeyboardButton("💳 Payment Methods"), KeyboardButton("👥 Referral"))
     markup.row(KeyboardButton("🤖 Models"), KeyboardButton("🔄 Restart"))
     markup.row(KeyboardButton("❓ Help"), KeyboardButton("📊 My Account"))
+    markup.row(KeyboardButton("🎨 Create Image"), KeyboardButton("🎵 Create Music"))
     return markup
 
 
@@ -117,7 +119,19 @@ def system_prompt():
         "If the user speaks Amharic, respond naturally in Amharic. "
         "If the user speaks another language, respond naturally in that language. "
         "Do not unnecessarily say that you are a bot. Do not use hashtag symbols. "
-        "Be helpful, clear and natural. Remember relevant conversation context."
+        "Be helpful, clear and natural. Remember relevant conversation context. "
+        "IMPORTANT: You cannot generate images, videos, or music yourself through this chat. "
+        "If the user asks you to create, draw, generate, or make an image/photo/picture, "
+        "do NOT pretend to create one or describe a fake result. Instead, tell them to tap "
+        "the '🎨 Create Image' button in the menu to actually generate a real image. "
+        "If the user asks you to create, compose, or make music or a song, do NOT pretend "
+        "to create one. Instead, tell them to tap the '🎵 Create Music' button in the menu. "
+        "Never claim you generated, sent, or attached an image, video, or audio file "
+        "unless a real file was actually sent through the system. "
+        "FORMATTING: Write in clean, natural, conversational prose for any language. "
+        "Do not use markdown symbols such as **, ##, or excessive bullet dashes. "
+        "Use plain sentences and, if a list is genuinely needed, simple short lines "
+        "without decorative symbols."
     )
 
 
@@ -206,9 +220,16 @@ def typing_loop(chat_id, stop_event):
         stop_event.wait(4)
 
 
+def clean_formatting(text):
+    text = text.replace("**", "").replace("###", "").replace("##", "")
+    text = text.replace("* ", "- ")
+    return text
+
+
 def send_long_message(chat_id, text):
     if not text:
         text = "Sorry, I could not generate a response."
+    text = clean_formatting(text)
     for i in range(0, len(text), 4000):
         bot.send_message(chat_id, text[i:i + 4000])
 
@@ -222,11 +243,12 @@ def start(message):
         f"Hello {name}! Welcome to BOSSAI — your all-in-one AI assistant.\n\n"
         "Access GPT-4o, Claude, DeepSeek, Grok, and Gemini in one bot.\n\n"
         "I can:\n"
-        "• Answer questions\n"
-        "• Write and translate text\n"
-        "• Write and debug code\n"
-        "• Solve math problems\n"
-        "• Remember conversations\n\n"
+        "- Answer questions\n"
+        "- Write and translate text\n"
+        "- Write and debug code\n"
+        "- Solve math problems\n"
+        "- Remember conversations\n"
+        "- Create real images and music\n\n"
         f"Free: {FREE_LIMIT} messages per day\n"
         f"Unlimited: {MONTHLY_PRICE} ETB/month\n\n"
         "Use the buttons below."
@@ -245,8 +267,10 @@ def help_command(message):
         "Payment Methods: Choose Telebirr, Payoneer or PayPal.\n"
         "Referral: Invite users and receive discounts.\n"
         "Models: Choose your AI model.\n"
+        "Create Image: Generate a real image from a description.\n"
+        "Create Music: Generate a real short music clip from a description.\n"
         "Restart: Clear your current conversation.\n\n"
-        "Support: @Huss_moham"
+        "Support: @Silent_Survivorr"
     )
 
 
@@ -371,7 +395,7 @@ def payment_decision(call):
         conn.close()
 
         bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-        bot.send_message(user_id, "Your payment receipt was rejected.\n\nPlease send a valid receipt again.\n\nSupport:@Silent_Survivorr")
+        bot.send_message(user_id, "Your payment receipt was rejected.\n\nPlease send a valid receipt again.\n\nSupport: @Silent_Survivorr")
 
 
 @bot.message_handler(func=lambda m: m.text == "👥 Referral")
@@ -384,8 +408,8 @@ def referral(message):
     bot.send_message(
         message.chat.id,
         f"Referral Program\n\nYour referral link:\n{referral_link}\n\n"
-        f"30 referrals → 70 ETB/month\n"
-        f"50 referrals + 10 paid referrals → 50 ETB/month\n\n"
+        f"30 referrals gives you 70 ETB/month.\n"
+        f"50 referrals plus 10 paid referrals gives you 50 ETB/month.\n\n"
         f"Your referrals: {user['referrals']}\n"
         f"Paid referrals: {user['paid_referrals']}\n\n"
         f"Current price: {price} ETB/month"
@@ -463,6 +487,223 @@ def file_handler(message):
     bot.reply_to(message, "I received your file.\n\nFile and voice analysis can be connected to the appropriate processing service.")
 
 
+IMAGE_MODEL = "google/gemini-2.5-flash-image"
+
+
+def generate_image(prompt):
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is missing.")
+
+    response = requests.post(
+        "https://openrouter.ai/api/v1/images",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={"model": IMAGE_MODEL, "prompt": prompt},
+        timeout=120
+    )
+
+    if not response.ok:
+        raise RuntimeError(f"Image API {response.status_code}: {response.text[:300]}")
+
+    data = response.json()
+    items = data.get("data") or []
+
+    if not items:
+        raise RuntimeError("No image data returned.")
+
+    b64 = items[0].get("b64_json")
+
+    if not b64:
+        raise RuntimeError("No image data returned.")
+
+    return base64.b64decode(b64)
+
+
+image_waiting = set()
+
+
+@bot.message_handler(func=lambda m: m.text == "🎨 Create Image")
+def image_button(message):
+    image_waiting.add(message.from_user.id)
+    bot.send_message(
+        message.chat.id,
+        "Create Image\n\n"
+        "Send me a description of the image you want.\n\n"
+        "Example:\nA futuristic city at night, cinematic lighting, realistic, highly detailed."
+    )
+
+
+def process_image_prompt(message):
+    user_id = message.from_user.id
+    image_waiting.discard(user_id)
+
+    prompt = message.text.strip()
+
+    if not prompt:
+        bot.send_message(message.chat.id, "Please describe the image you want.")
+        return
+
+    user = get_user(user_id, message.from_user.first_name, message.from_user.username)
+
+    if not subscription_active(user):
+        if user["free_used"] >= FREE_LIMIT:
+            bot.reply_to(
+                message,
+                f"You have used all {FREE_LIMIT} free messages for today.\n\n"
+                f"Unlimited access is {MONTHLY_PRICE} ETB/month.\n\n"
+                "Open Payment Methods to continue."
+            )
+            return
+        conn = get_db()
+        conn.execute("UPDATE users SET free_used=free_used+1 WHERE user_id=?", (user_id,))
+        conn.commit()
+        conn.close()
+
+    stop_event = threading.Event()
+    typing_thread = threading.Thread(target=typing_loop, args=(message.chat.id, stop_event), daemon=True)
+    typing_thread.start()
+
+    try:
+        bot.send_message(message.chat.id, "Creating your image, please wait...")
+        image_bytes = generate_image(prompt)
+        bot.send_photo(message.chat.id, image_bytes, caption="Generated by BOSSAI")
+    except Exception as error:
+        print("IMAGE ERROR:", error)
+        traceback.print_exc()
+        bot.send_message(message.chat.id, f"Debug info (temporary): {str(error)[:500]}")
+    finally:
+        stop_event.set()
+
+
+MUSIC_MODEL = "google/lyria-3-clip-preview"
+
+
+def generate_music(prompt):
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is missing.")
+
+    response = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": MUSIC_MODEL,
+            "modalities": ["text", "audio"],
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=180
+    )
+
+    if not response.ok:
+        raise RuntimeError(f"Music API {response.status_code}: {response.text[:300]}")
+
+    data = response.json()
+    reply_message = data["choices"][0]["message"]
+    audio = reply_message.get("audio")
+
+    if not audio or not audio.get("data"):
+        raise RuntimeError("No audio data returned from music model.")
+
+    return base64.b64decode(audio["data"])
+
+
+music_waiting = set()
+
+
+@bot.message_handler(func=lambda m: m.text == "🎵 Create Music")
+def music_button(message):
+    music_waiting.add(message.from_user.id)
+    bot.send_message(
+        message.chat.id,
+        "Create Music\n\n"
+        "Describe the song or music you want (genre, mood, instruments).\n\n"
+        "Example:\nUpbeat Ethiopian-inspired pop song about friendship, happy mood."
+    )
+
+
+def process_music_prompt(message):
+    user_id = message.from_user.id
+    music_waiting.discard(user_id)
+
+    prompt = message.text.strip()
+
+    if not prompt:
+        bot.send_message(message.chat.id, "Please describe the music you want.")
+        return
+
+    user = get_user(user_id, message.from_user.first_name, message.from_user.username)
+
+    if not subscription_active(user):
+        if user["free_used"] >= FREE_LIMIT:
+            bot.reply_to(
+                message,
+                f"You have used all {FREE_LIMIT} free messages for today.\n\n"
+                f"Unlimited access is {MONTHLY_PRICE} ETB/month.\n\n"
+                "Open Payment Methods to continue."
+            )
+            return
+        conn = get_db()
+        conn.execute("UPDATE users SET free_used=free_used+1 WHERE user_id=?", (user_id,))
+        conn.commit()
+        conn.close()
+
+    stop_event = threading.Event()
+    typing_thread = threading.Thread(target=typing_loop, args=(message.chat.id, stop_event), daemon=True)
+    typing_thread.start()
+
+    try:
+        bot.send_message(message.chat.id, "Composing your music, this can take a minute...")
+        audio_bytes = generate_music(prompt)
+        audio_file = io.BytesIO(audio_bytes)
+        audio_file.name = "bossai_music.mp3"
+        bot.send_audio(message.chat.id, audio_file, caption="Generated by BOSSAI")
+    except Exception as error:
+        print("MUSIC ERROR:", error)
+        traceback.print_exc()
+        bot.send_message(message.chat.id, f"Debug info (temporary): {str(error)[:500]}")
+    finally:
+        stop_event.set()
+
+
+@bot.message_handler(commands=["admin"])
+def admin_command(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    now = int(time.time())
+    soon = now + (3 * 86400)
+
+    conn = get_db()
+
+    total_users = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+    active_subs = conn.execute("SELECT COUNT(*) AS c FROM users WHERE subscription_until > ?", (now,)).fetchone()["c"]
+    expiring_soon = conn.execute(
+        "SELECT COUNT(*) AS c FROM users WHERE subscription_until > ? AND subscription_until <= ?",
+        (now, soon)
+    ).fetchone()["c"]
+    pending = conn.execute("SELECT COUNT(*) AS c FROM payments WHERE status='pending'").fetchone()["c"]
+    approved = conn.execute("SELECT COUNT(*) AS c FROM payments WHERE status='approved'").fetchone()["c"]
+    rejected = conn.execute("SELECT COUNT(*) AS c FROM payments WHERE status='rejected'").fetchone()["c"]
+
+    conn.close()
+
+    report = (
+        "BOSSAI Admin Dashboard\n\n"
+        f"Total users: {total_users}\n"
+        f"Active subscribers: {active_subs}\n"
+        f"Expiring within 3 days: {expiring_soon}\n\n"
+        f"Pending payment reviews: {pending}\n"
+        f"Approved payments (all time): {approved}\n"
+        f"Rejected payments (all time): {rejected}"
+    )
+
+    bot.send_message(message.chat.id, report)
+
+
 busy_users = set()
 busy_lock = threading.Lock()
 last_request = {}
@@ -475,10 +716,19 @@ def chat(message):
         return
 
     user_id = message.from_user.id
+
+    if user_id in image_waiting:
+        process_image_prompt(message)
+        return
+
+    if user_id in music_waiting:
+        process_music_prompt(message)
+        return
+
     now = time.time()
     previous = last_request.get(user_id, 0)
     if now - previous < 2:
-        bot.reply_to(message, "⏳ Wait a moment before your next message.")
+        bot.reply_to(message, "Wait a moment before your next message.")
         return
     last_request[user_id] = now
 
@@ -501,7 +751,7 @@ def chat(message):
 
     with busy_lock:
         if user_id in busy_users:
-            bot.reply_to(message, "⏳ Wait a moment, your previous message is still processing.")
+            bot.reply_to(message, "Wait a moment, your previous message is still processing.")
             return
         busy_users.add(user_id)
 
@@ -517,7 +767,7 @@ def chat(message):
     except Exception as error:
         print("CHAT ERROR:", error)
         traceback.print_exc()
-        bot.reply_to(message, f"⚠️ Debug info (temporary): {str(error)[:500]}")
+        bot.reply_to(message, f"Debug info (temporary): {str(error)[:500]}")
     finally:
         stop_event.set()
         with busy_lock:
@@ -530,15 +780,15 @@ def startup_diagnostic():
 
     def status_line(name, value):
         if not value:
-            return f"❌ {name}: NOT SET"
+            return f"NOT SET: {name}"
         tail = value[-4:] if len(value) >= 4 else value
-        return f"✅ {name}: set (…{tail}, length {len(value)})"
+        return f"OK: {name} (ends in {tail}, length {len(value)})"
 
-    report = "🔧 BOSSAI Startup Diagnostic\n\n"
+    report = "BOSSAI Startup Diagnostic\n\n"
     report += status_line("TELEGRAM_BOT_TOKEN", TOKEN) + "\n"
     report += status_line("GEMINI_API_KEY", GEMINI_API_KEY) + "\n"
     report += status_line("OPENROUTER_API_KEY", OPENROUTER_API_KEY) + "\n"
-    report += f"✅ ADMIN_ID: {ADMIN_ID}\n"
+    report += f"ADMIN_ID: {ADMIN_ID}\n"
 
     try:
         bot.send_message(ADMIN_ID, report)
