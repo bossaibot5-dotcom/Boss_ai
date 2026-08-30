@@ -371,7 +371,7 @@ def payment_decision(call):
         conn.close()
 
         bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-        bot.send_message(user_id, "Your payment receipt was rejected.\n\nPlease send a valid receipt again.\n\nSupport: @Huss_moham")
+        bot.send_message(user_id, "Your payment receipt was rejected.\n\nPlease send a valid receipt again.\n\nSupport:@Silent_Survivorr")
 
 
 @bot.message_handler(func=lambda m: m.text == "👥 Referral")
