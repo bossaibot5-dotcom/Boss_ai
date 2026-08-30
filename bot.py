@@ -244,19 +244,44 @@ def clean_formatting(text):
     return text
 
 
-def send_long_message(chat_id, text):
+def send_long_message(message, text):
     if not text:
         text = "Sorry, I could not generate a response."
     text = clean_formatting(text)
-    for i in range(0, len(text), 4000):
-        bot.send_message(chat_id, text[i:i + 4000])
+
+    chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
+    if not chunks:
+        return
+
+    # Reply directly to the user's message so the answer is threaded to their question.
+    bot.reply_to(message, chunks[0])
+    for chunk in chunks[1:]:
+        bot.send_message(message.chat.id, chunk)
+
+
+def send_welcome(message, extra_note=""):
+    name = message.from_user.first_name or "there"
+    text = (
+        f"Hello {name}! Welcome to BOSSAI — your all-in-one AI assistant.\n\n"
+        "Access GPT-4o, Claude, DeepSeek, Grok, and Gemini in one bot.\n\n"
+        "I can:\n"
+        "- Answer questions\n"
+        "- Write and translate text\n"
+        "- Write and debug code\n"
+        "- Solve math problems\n"
+        "- Remember conversations\n"
+        "- Create real images and music\n\n"
+        f"Free: {FREE_LIMIT} messages per day\n"
+        f"Unlimited: {MONTHLY_PRICE} ETB/month\n\n"
+        "Use the buttons below."
+    )
+    bot.send_message(message.chat.id, text + extra_note, reply_markup=main_keyboard(message.from_user.id))
 
 
 @bot.message_handler(commands=["start"])
 def start(message):
     user_id = message.from_user.id
     user = get_user(user_id, message.from_user.first_name, message.from_user.username)
-    name = message.from_user.first_name or "there"
 
     referral_note = ""
 
@@ -280,21 +305,7 @@ def start(message):
             except (ValueError, IndexError):
                 pass
 
-    text = (
-        f"Hello {name}! Welcome to BOSSAI — your all-in-one AI assistant.\n\n"
-        "Access GPT-4o, Claude, DeepSeek, Grok, and Gemini in one bot.\n\n"
-        "I can:\n"
-        "- Answer questions\n"
-        "- Write and translate text\n"
-        "- Write and debug code\n"
-        "- Solve math problems\n"
-        "- Remember conversations\n"
-        "- Create real images and music\n\n"
-        f"Free: {FREE_LIMIT} messages per day\n"
-        f"Unlimited: {MONTHLY_PRICE} ETB/month\n\n"
-        "Use the buttons below."
-    )
-    bot.send_message(message.chat.id, text + referral_note, reply_markup=main_keyboard(message.from_user.id))
+    send_welcome(message, referral_note)
 
 
 @bot.message_handler(commands=["help"])
@@ -440,7 +451,11 @@ def payment_decision(call):
         conn.close()
 
         bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-        bot.send_message(user_id, "Payment approved.\n\nYour unlimited subscription is active for 30 days.\n\nThank you for using BOSSAI.")
+        bot.send_message(
+            user_id,
+            "Payment approved.\n\nYour unlimited subscription is active for 30 days.\n\nThank you for using BOSSAI.",
+            reply_markup=main_keyboard(user_id)
+        )
     else:
         conn = get_db()
         conn.execute("UPDATE payments SET status='rejected' WHERE id=?", (payment_id,))
@@ -448,7 +463,11 @@ def payment_decision(call):
         conn.close()
 
         bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-        bot.send_message(user_id, "Your payment receipt was rejected.\n\nPlease send a valid receipt again.\n\nSupport: @Silent_Survivorr")
+        bot.send_message(
+            user_id,
+            "Your payment receipt was rejected.\n\nPlease send a valid receipt again.\n\nSupport: @Silent_Survivorr",
+            reply_markup=main_keyboard(user_id)
+        )
 
 
 @bot.message_handler(func=lambda m: m.text == "👥 Referral")
@@ -547,7 +566,7 @@ def restart(message):
     conn.execute("DELETE FROM messages WHERE user_id=?", (message.from_user.id,))
     conn.commit()
     conn.close()
-    bot.send_message(message.chat.id, "Conversation restarted. You can start a new chat.", reply_markup=main_keyboard(message.from_user.id))
+    send_welcome(message, "\n\n🔄 Your conversation memory has been cleared.")
 
 
 @bot.message_handler(content_types=["document", "voice", "audio"])
@@ -971,7 +990,7 @@ def chat(message):
         save_message(user_id, "user", text)
         answer = ask_ai(user_id, text)
         save_message(user_id, "assistant", answer)
-        send_long_message(message.chat.id, answer)
+        send_long_message(message, answer)
     except Exception as error:
         print("CHAT ERROR:", error)
         traceback.print_exc()
