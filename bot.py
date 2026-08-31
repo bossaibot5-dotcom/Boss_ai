@@ -1393,15 +1393,38 @@ def startup_diagnostic():
         print("Could not send startup diagnostic:", e)
 
 
+def notify_admin(text):
+    if ADMIN_ID == 0:
+        return
+    try:
+        bot.send_message(ADMIN_ID, text)
+    except Exception as e:
+        print("Could not notify admin:", e)
+
+
 def main():
-    init_database()
+    try:
+        init_database()
+    except Exception as error:
+        print("Database init error:", error)
+        notify_admin(f"BOSSAI failed to initialize the database:\n{str(error)[:500]}")
+
     print("BOSSAI is running...")
+
+    try:
+        bot.remove_webhook()
+    except Exception as error:
+        print("Could not remove webhook:", error)
+
     startup_diagnostic()
+
     while True:
         try:
             bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
         except Exception as error:
             print("Polling error:", error)
+            traceback.print_exc()
+            notify_admin(f"BOSSAI polling stopped with an error and is retrying:\n{str(error)[:500]}")
             time.sleep(5)
 
 
