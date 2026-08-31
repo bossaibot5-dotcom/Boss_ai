@@ -10,6 +10,7 @@ import requests
 import telebot
 
 from google import genai
+from docx import Document as DocxDocument
 
 from telebot.types import (
     ReplyKeyboardMarkup,
@@ -40,9 +41,15 @@ def get_db():
 
 def init_database():
     conn = get_db()
-    conn.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, first_name TEXT, username TEXT, free_used INTEGER DEFAULT 0, free_date TEXT, model TEXT DEFAULT 'DeepSeek', subscription_until INTEGER DEFAULT 0, referred_by INTEGER DEFAULT NULL, referrals INTEGER DEFAULT 0, paid_referrals INTEGER DEFAULT 0, created_at INTEGER)")
+    conn.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, first_name TEXT, username TEXT, free_used INTEGER DEFAULT 0, free_date TEXT, model TEXT DEFAULT 'GPT-4o', subscription_until INTEGER DEFAULT 0, referred_by INTEGER DEFAULT NULL, referrals INTEGER DEFAULT 0, paid_referrals INTEGER DEFAULT 0, created_at INTEGER, notes TEXT DEFAULT '')")
     conn.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, role TEXT, content TEXT, created_at INTEGER)")
     conn.execute("CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER, status TEXT DEFAULT 'pending', created_at INTEGER)")
+    conn.execute("CREATE TABLE IF NOT EXISTS feedback (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, rating TEXT, created_at INTEGER)")
+
+    # Safe migration: add notes column if this is an older database file.
+    existing_columns = [row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
+    if "notes" not in existing_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN notes TEXT DEFAULT ''")
     conn.commit()
     conn.close()
 
@@ -89,6 +96,7 @@ def main_keyboard(user_id=None):
     markup.row(KeyboardButton("🤖 Models"), KeyboardButton("🔄 Restart"))
     markup.row(KeyboardButton("❓ Help"), KeyboardButton("📊 My Account"))
     markup.row(KeyboardButton("🎨 Create Image"), KeyboardButton("🎵 Create Music"))
+    markup.row(KeyboardButton("📄 Create Document"), KeyboardButton("🧠 My Memory"))
     if user_id is not None and ADMIN_ID != 0 and user_id == ADMIN_ID:
         markup.row(KeyboardButton("👑 Admin Panel"))
     return markup
@@ -115,8 +123,8 @@ def get_history(user_id):
     return [{"role": row["role"], "content": row["content"]} for row in rows]
 
 
-def system_prompt():
-    return (
+def system_prompt(notes=""):
+    base = (
         "You are BOSSAI, a natural all-in-one AI assistant. "
         "Default language is English unless the user writes in another language.\n\n"
 
@@ -152,6 +160,14 @@ def system_prompt():
         "without decorative symbols."
     )
 
+    if notes:
+        base += (
+            "\n\nWhat you remember about this specific user (use naturally when relevant, "
+            "do not just recite it back):\n" + notes
+        )
+
+    return base
+
 
 CHAT_MODELS = {
     "DeepSeek": "deepseek/deepseek-chat",
@@ -169,7 +185,7 @@ def ask_openrouter(user_id, text):
     model = user["model"]
     history = get_history(user_id)
 
-    messages = [{"role": "system", "content": system_prompt()}]
+    messages = [{"role": "system", "content": system_prompt(user["notes"] or "")}]
     messages.extend(history)
     messages.append({"role": "user", "content": text})
 
@@ -179,7 +195,7 @@ def ask_openrouter(user_id, text):
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
         },
-        json={"model": CHAT_MODELS.get(model, CHAT_MODELS["DeepSeek"]), "messages": messages},
+        json={"model": CHAT_MODELS.get(model, CHAT_MODELS["GPT-4o"]), "messages": messages},
         timeout=90
     )
 
@@ -194,12 +210,13 @@ def ask_gemini(user_id, text):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is missing.")
 
+    user = get_user(user_id)
     history = get_history(user_id)
     conversation = ""
     for item in history:
         conversation += item["role"] + ": " + item["content"] + "\n"
 
-    prompt = system_prompt() + "\n\nPrevious conversation:\n" + conversation + "\n\nCurrent user message:\n" + text
+    prompt = system_prompt(user["notes"] or "") + "\n\nPrevious conversation:\n" + conversation + "\n\nCurrent user message:\n" + text
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     response = client.models.generate_content(model="gemini-3.6-flash", contents=prompt)
@@ -229,6 +246,18 @@ def ask_ai(user_id, text):
         raise
 
 
+def notify_admin_error(context, user_id, error):
+    if ADMIN_ID == 0:
+        return
+    try:
+        bot.send_message(
+            ADMIN_ID,
+            f"⚠️ BOSSAI Error\n\nContext: {context}\nUser ID: {user_id}\nError: {str(error)[:400]}"
+        )
+    except Exception as notify_error:
+        print("Could not notify admin of error:", notify_error)
+
+
 def typing_loop(chat_id, stop_event):
     while not stop_event.is_set():
         try:
@@ -244,7 +273,7 @@ def clean_formatting(text):
     return text
 
 
-def send_long_message(message, text):
+def send_long_message(message, text, feedback_markup=None):
     if not text:
         text = "Sorry, I could not generate a response."
     text = clean_formatting(text)
@@ -254,9 +283,14 @@ def send_long_message(message, text):
         return
 
     # Reply directly to the user's message so the answer is threaded to their question.
+    if len(chunks) == 1:
+        bot.reply_to(message, chunks[0], reply_markup=feedback_markup)
+        return
+
     bot.reply_to(message, chunks[0])
-    for chunk in chunks[1:]:
+    for chunk in chunks[1:-1]:
         bot.send_message(message.chat.id, chunk)
+    bot.send_message(message.chat.id, chunks[-1], reply_markup=feedback_markup)
 
 
 def send_welcome(message, extra_note=""):
@@ -281,6 +315,11 @@ def send_welcome(message, extra_note=""):
 @bot.message_handler(commands=["start"])
 def start(message):
     user_id = message.from_user.id
+
+    conn = get_db()
+    already_existed = conn.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)).fetchone() is not None
+    conn.close()
+
     user = get_user(user_id, message.from_user.first_name, message.from_user.username)
 
     referral_note = ""
@@ -306,6 +345,24 @@ def start(message):
                 pass
 
     send_welcome(message, referral_note)
+
+    if not already_existed:
+        bot.send_message(
+            message.chat.id,
+            "🎓 Quick Tutorial\n\n"
+            "💳 Payment Methods — subscribe for unlimited access\n"
+            "👥 Referral — invite friends and unlock discounts\n"
+            "🤖 Models — pick which AI model answers you\n"
+            "🔄 Restart — clear the current conversation\n"
+            "❓ Help — see this info again\n"
+            "📊 My Account — check your plan and usage\n"
+            "🎨 Create Image — generate a real image\n"
+            "🎵 Create Music — generate a real short music clip\n"
+            "📄 Create Document — generate a Word file (unlimited subscribers)\n"
+            "🧠 My Memory — tell me things to remember about you\n\n"
+            "You can also just type any question directly, right now."
+        )
+
 
 
 @bot.message_handler(commands=["help"])
@@ -353,6 +410,9 @@ def payment_button(message):
     show_payment_menu(message)
 
 
+telebirr_waiting = set()
+
+
 @bot.callback_query_handler(func=lambda call: call.data in ["telebirr", "payoneer", "paypal"])
 def payment_callback(call):
     bot.answer_callback_query(call.id)
@@ -360,6 +420,7 @@ def payment_callback(call):
     if call.data == "telebirr":
         user = get_user(call.from_user.id)
         price = get_subscription_price(user)
+        telebirr_waiting.add(call.from_user.id)
         bot.send_message(
             call.message.chat.id,
             f"Telebirr Payment\n\n"
@@ -376,7 +437,18 @@ def payment_callback(call):
 
 
 @bot.message_handler(content_types=["photo"])
-def payment_receipt(message):
+def photo_handler(message):
+    user_id = message.from_user.id
+
+    if user_id in telebirr_waiting:
+        telebirr_waiting.discard(user_id)
+        handle_payment_receipt(message)
+        return
+
+    handle_vision_photo(message)
+
+
+def handle_payment_receipt(message):
     if ADMIN_ID == 0:
         bot.reply_to(message, "Receipt received. Admin verification is not configured yet.")
         return
@@ -408,6 +480,75 @@ def payment_receipt(message):
 
     bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=caption, reply_markup=markup)
     bot.reply_to(message, "Your receipt has been sent for verification. Please wait for approval.")
+
+
+def handle_vision_photo(message):
+    user_id = message.from_user.id
+    user = get_user(user_id, message.from_user.first_name, message.from_user.username)
+
+    if not subscription_active(user):
+        if user["free_used"] >= FREE_LIMIT:
+            bot.reply_to(
+                message,
+                f"You have used all {FREE_LIMIT} free messages for today.\n\n"
+                f"Unlimited access is {MONTHLY_PRICE} ETB/month.\n\n"
+                "Open Payment Methods to continue."
+            )
+            return
+        conn = get_db()
+        conn.execute("UPDATE users SET free_used=free_used+1 WHERE user_id=?", (user_id,))
+        conn.commit()
+        conn.close()
+
+    if not OPENROUTER_API_KEY:
+        bot.reply_to(message, "Photo understanding is not available right now.")
+        return
+
+    question = (message.caption or "What is in this image? Describe it naturally.").strip()
+
+    stop_event = threading.Event()
+    typing_thread = threading.Thread(target=typing_loop, args=(message.chat.id, stop_event), daemon=True)
+    typing_thread.start()
+
+    try:
+        file_info = bot.get_file(message.photo[-1].file_id)
+        file_bytes = bot.download_file(file_info.file_path)
+        image_b64 = base64.b64encode(file_bytes).decode("utf-8")
+
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": CHAT_MODELS["GPT-4o"],
+                "messages": [
+                    {"role": "system", "content": system_prompt(user["notes"] or "")},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": question},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                        ],
+                    },
+                ],
+            },
+            timeout=90
+        )
+
+        if not response.ok:
+            raise RuntimeError(f"Vision API {response.status_code}: {response.text[:300]}")
+
+        answer = response.json()["choices"][0]["message"]["content"]
+        send_long_message(message, answer)
+    except Exception as error:
+        print("VISION ERROR:", error)
+        traceback.print_exc()
+        notify_admin_error("Vision", user_id, error)
+        bot.reply_to(message, f"Debug info (temporary): {str(error)[:500]}")
+    finally:
+        stop_event.set()
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("approve:") or call.data.startswith("reject:"))
@@ -528,6 +669,56 @@ def model_callback(call):
     conn.close()
 
     bot.send_message(call.message.chat.id, f"Model changed to {model}.")
+
+
+memory_waiting = set()
+
+
+@bot.message_handler(func=lambda m: m.text == "🧠 My Memory")
+def memory_button(message):
+    user = get_user(message.from_user.id, message.from_user.first_name, message.from_user.username)
+    memory_waiting.add(message.from_user.id)
+
+    current = user["notes"] or "Nothing saved yet."
+    bot.reply_to(
+        message,
+        "🧠 My Memory\n\n"
+        f"What I currently remember about you:\n{current}\n\n"
+        "Send me anything you want me to remember (your name, your work, your preferences, "
+        "things you don't want repeated every time). Send \"clear\" to erase everything I remember."
+    )
+
+
+def process_memory_input(message):
+    user_id = message.from_user.id
+    memory_waiting.discard(user_id)
+
+    text = (message.text or "").strip()
+    if not text:
+        bot.reply_to(message, "Please send something to remember, or send \"clear\" to erase memory.")
+        return
+
+    conn = get_db()
+
+    if text.lower() in ["clear", "አጥፊ", "አጥፋ", "ሰርዝ"]:
+        conn.execute("UPDATE users SET notes='' WHERE user_id=?", (user_id,))
+        conn.commit()
+        conn.close()
+        bot.reply_to(message, "🧠 Your memory has been cleared.")
+        return
+
+    current = get_user(user_id)["notes"] or ""
+    updated = (current + "\n- " + text).strip() if current else "- " + text
+
+    # Keep it from growing unbounded.
+    if len(updated) > 2000:
+        updated = updated[-2000:]
+
+    conn.execute("UPDATE users SET notes=? WHERE user_id=?", (updated, user_id))
+    conn.commit()
+    conn.close()
+
+    bot.reply_to(message, "🧠 Got it, I'll remember that.")
 
 
 @bot.message_handler(func=lambda m: m.text == "📊 My Account")
@@ -659,6 +850,7 @@ def process_image_prompt(message):
     except Exception as error:
         print("IMAGE ERROR:", error)
         traceback.print_exc()
+        notify_admin_error("Image generation", user_id, error)
         bot.send_message(message.chat.id, f"Debug info (temporary): {str(error)[:500]}")
     finally:
         stop_event.set()
@@ -772,6 +964,137 @@ def process_music_prompt(message):
     except Exception as error:
         print("MUSIC ERROR:", error)
         traceback.print_exc()
+        notify_admin_error("Music generation", user_id, error)
+        bot.send_message(message.chat.id, f"Debug info (temporary): {str(error)[:500]}")
+    finally:
+        stop_event.set()
+
+
+def ask_document_content(topic):
+    """Generate well-structured document text (separate from chat history)."""
+    document_system_prompt = (
+        "You write clean, well-structured documents (reports, letters, essays, "
+        "articles, plans, etc.) based on the user's request. "
+        "Respond in the same language the user wrote in, with natural, fluent, "
+        "professional writing (if Amharic, write like an educated native speaker). "
+        "Do not use markdown symbols such as **, ##, or bullet dashes made of *. "
+        "Structure the document with a clear title on the first line, followed by "
+        "well-organized paragraphs or numbered sections as appropriate. "
+        "Do not add commentary about being an AI; just produce the document content."
+    )
+
+    if OPENROUTER_API_KEY:
+        try:
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": CHAT_MODELS["DeepSeek"],
+                    "messages": [
+                        {"role": "system", "content": document_system_prompt},
+                        {"role": "user", "content": topic},
+                    ],
+                },
+                timeout=120
+            )
+            if response.ok:
+                return response.json()["choices"][0]["message"]["content"]
+        except Exception as error:
+            print("Document OpenRouter failed:", error)
+
+    if GEMINI_API_KEY:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=document_system_prompt + "\n\nRequest:\n" + topic
+        )
+        if response.text:
+            return response.text
+
+    raise RuntimeError("No AI service is available to write the document right now.")
+
+
+def build_docx(text):
+    lines = [line.strip() for line in text.strip().split("\n") if line.strip()]
+    document = DocxDocument()
+
+    if lines:
+        document.add_heading(lines[0], level=1)
+        remaining = lines[1:]
+    else:
+        remaining = lines
+
+    for line in remaining:
+        document.add_paragraph(line)
+
+    buffer = io.BytesIO()
+    document.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+doc_waiting = set()
+
+
+@bot.message_handler(func=lambda m: m.text == "📄 Create Document")
+def document_button(message):
+    user = get_user(message.from_user.id, message.from_user.first_name, message.from_user.username)
+
+    if not subscription_active(user):
+        bot.reply_to(
+            message,
+            "📄 Document creation is available for unlimited subscribers only.\n\n"
+            f"Unlimited access is {MONTHLY_PRICE} ETB/month.\n\n"
+            "Open Payment Methods to subscribe."
+        )
+        return
+
+    doc_waiting.add(message.from_user.id)
+    bot.reply_to(
+        message,
+        "📄 Create Document\n\n"
+        "Tell me what the document should be about (a report, letter, essay, plan, etc.). "
+        "You can be as detailed as you like.\n\n"
+        "I will write it and send it back as a Word (.docx) file."
+    )
+
+
+def process_document_prompt(message):
+    user_id = message.from_user.id
+    doc_waiting.discard(user_id)
+
+    topic = (message.text or "").strip()
+    if not topic:
+        bot.reply_to(message, "Please describe the document you want.")
+        return
+
+    user = get_user(user_id, message.from_user.first_name, message.from_user.username)
+    if not subscription_active(user):
+        bot.reply_to(
+            message,
+            "📄 Document creation is available for unlimited subscribers only.\n\n"
+            f"Unlimited access is {MONTHLY_PRICE} ETB/month.\n\n"
+            "Open Payment Methods to subscribe."
+        )
+        return
+
+    stop_event = threading.Event()
+    typing_thread = threading.Thread(target=typing_loop, args=(message.chat.id, stop_event), daemon=True)
+    typing_thread.start()
+
+    try:
+        bot.reply_to(message, "📄 Writing your document, please wait...")
+        content = clean_formatting(ask_document_content(topic))
+        docx_file = build_docx(content)
+        docx_file.name = "bossai_document.docx"
+        bot.send_document(message.chat.id, docx_file, caption="📄 Generated by BOSSAI")
+    except Exception as error:
+        print("DOCUMENT ERROR:", error)
+        traceback.print_exc()
+        notify_admin_error("Document generation", user_id, error)
         bot.send_message(message.chat.id, f"Debug info (temporary): {str(error)[:500]}")
     finally:
         stop_event.set()
@@ -952,6 +1275,14 @@ def chat(message):
         process_music_prompt(message)
         return
 
+    if user_id in doc_waiting:
+        process_document_prompt(message)
+        return
+
+    if user_id in memory_waiting:
+        process_memory_input(message)
+        return
+
     now = time.time()
     previous = last_request.get(user_id, 0)
     if now - previous < 2:
@@ -990,15 +1321,50 @@ def chat(message):
         save_message(user_id, "user", text)
         answer = ask_ai(user_id, text)
         save_message(user_id, "assistant", answer)
-        send_long_message(message, answer)
+
+        conn = get_db()
+        cursor = conn.execute(
+            "INSERT INTO feedback (user_id, rating, created_at) VALUES (?, NULL, ?)",
+            (user_id, int(time.time()))
+        )
+        feedback_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+
+        feedback_markup = InlineKeyboardMarkup()
+        feedback_markup.add(
+            InlineKeyboardButton("👍", callback_data=f"fb:{feedback_id}:up"),
+            InlineKeyboardButton("👎", callback_data=f"fb:{feedback_id}:down"),
+        )
+
+        send_long_message(message, answer, feedback_markup)
     except Exception as error:
         print("CHAT ERROR:", error)
         traceback.print_exc()
+        notify_admin_error("Chat", user_id, error)
         bot.reply_to(message, f"Debug info (temporary): {str(error)[:500]}")
     finally:
         stop_event.set()
         with busy_lock:
             busy_users.discard(user_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("fb:"))
+def feedback_callback(call):
+    bot.answer_callback_query(call.id, "Thanks for the feedback!")
+    parts = call.data.split(":")
+    feedback_id = int(parts[1])
+    rating = parts[2]
+
+    conn = get_db()
+    conn.execute("UPDATE feedback SET rating=? WHERE id=?", (rating, feedback_id))
+    conn.commit()
+    conn.close()
+
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
 
 
 def startup_diagnostic():
