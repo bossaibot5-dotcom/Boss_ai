@@ -23,7 +23,11 @@ from telebot.types import (
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "0").strip()
+try:
+    ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW else 0
+except ValueError:
+    ADMIN_ID = 0
 
 FREE_LIMIT = 15
 MONTHLY_PRICE = 100
